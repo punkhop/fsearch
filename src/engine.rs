@@ -540,7 +540,8 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     let home = shared.home.as_bytes().to_vec();
     // Reconcile all of home once, right away (cheap when nothing changed),
     // then follow along with the name index's changes.
-    sync(shared, &pool, &home, &[], std::slice::from_ref(&home));
+    let roots: Vec<Vec<u8>> = std::iter::once(home.clone()).chain(crate::walk::volume_roots().iter().cloned()).collect();
+    sync(shared, &pool, &home, &[], &roots);
     // Per-folder debounce: a folder is processed 2s after its last change,
     // or 5 min after its first pending one if it never goes quiet. A file you
     // save lands in ~2s; files apps rewrite every second (state, logs) cost
@@ -554,7 +555,7 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
                 for (d, t) in std::iter::once(first).chain(rx.try_iter()) {
                     for key in d.into_iter().map(|p| (p, false)).chain(t.into_iter().map(|p| (p, true))) {
                         // Most of the disk's churn (Library, caches) is outside the indexed area.
-                        if content::in_scope(&key.0, &home) || (key.1 && home.starts_with(&key.0)) {
+                        if content::in_scope(&key.0, &home) || (key.1 && roots.iter().any(|r| r.starts_with(&key.0))) {
                             pending.entry(key).and_modify(|e| e.1 = now).or_insert((now, now));
                         }
                     }

@@ -1074,10 +1074,8 @@ fn name_ok(name: &[u8], size: u64) -> bool {
 
 /// Is this path (file or directory) inside the indexed area?
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
-    let Some(rest) = path.strip_prefix(home) else { return false };
-    if !rest.is_empty() && rest[0] != b'/' {
-        return false;
-    }
+    let under = |root: &[u8]| path.strip_prefix(root).filter(|r| r.is_empty() || r[0] == b'/');
+    let Some(rest) = under(home).or_else(|| crate::walk::volume_roots().iter().find_map(|v| under(v))) else { return false };
     let rel = rest.strip_prefix(b"/").unwrap_or(rest);
     if SKIP_UNDER_HOME.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
         return false;
@@ -2245,9 +2243,13 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
         if in_scope(d, home) {
             out.push((d.clone(), r));
-        } else if r && home.starts_with(d) {
-            // A subtree containing home (e.g. "/" rescanned): sync all of home.
-            out.push((home.to_vec(), true));
+        } else if r {
+            // A subtree containing home or a volume (e.g. "/" rescanned): sync all of it.
+            for root in std::iter::once(home).chain(crate::walk::volume_roots().iter().map(Vec::as_slice)) {
+                if root.starts_with(d) {
+                    out.push((root.to_vec(), true));
+                }
+            }
         }
     }
     out.sort();
