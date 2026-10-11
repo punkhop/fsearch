@@ -239,25 +239,13 @@ fn install(login: bool) {
     let env = std::env::var("FSEARCH_VOLUMES").map_or(String::new(), |v| {
         format!("\n  <key>EnvironmentVariables</key><dict><key>FSEARCH_VOLUMES</key><string>{v}</string></dict>")
     });
-    // With volumes to index, start under /bin/bash (no exec): macOS then
-    // checks bash's Full Disk Access for the daemon, which a Mac used as a
-    // file server has usually granted already. Rebuilding never resets it.
-    let args = if env.is_empty() {
-        format!("<string>{}</string><string>serve</string>", bin.display())
-    } else {
-        // A separate copy for the daemon: once macOS has listed a binary in
-        // Full Disk Access switched off, that entry wins over bash's grant.
-        let daemon = bin.with_file_name("fsearchd");
-        std::fs::copy(&bin, &tmp).and_then(|_| std::fs::rename(&tmp, &daemon)).unwrap_or_else(|e| die(&format!("copy: {e}")));
-        format!("<string>/bin/bash</string><string>-c</string><string>'{}' serve; exit $?</string>", daemon.display())
-    };
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array>{args}</array>
+  <key>ProgramArguments</key><array><string>{}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>{env}
   <key>StandardOutPath</key><string>{}</string>
@@ -265,6 +253,7 @@ fn install(login: bool) {
 </dict>
 </plist>
 "#,
+        bin.display(),
         log.display(),
         log.display()
     );
