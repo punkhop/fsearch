@@ -27,13 +27,21 @@ pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// (comma-separated, e.g. "illmaculate,thesaurus"). Every other mount point
 /// is still left alone.
 fn crossable(name: &[u8]) -> bool {
+    volume_names().iter().any(|n| n == name)
+}
+
+fn volume_names() -> &'static [Vec<u8>] {
     static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
-    NAMES
-        .get_or_init(|| {
-            std::env::var("FSEARCH_VOLUMES").unwrap_or_default().split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect()
-        })
-        .iter()
-        .any(|n| n == name)
+    NAMES.get_or_init(|| {
+        std::env::var("FSEARCH_VOLUMES").unwrap_or_default().split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect()
+    })
+}
+
+/// The FSEARCH_VOLUMES volumes as paths ("/Volumes/illmaculate"). Their
+/// text is content-indexed as home's is, each volume its own root.
+pub fn volume_roots() -> &'static [Vec<u8>] {
+    static ROOTS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| volume_names().iter().map(|n| [b"/Volumes/".as_slice(), n].concat()).collect())
 }
 
 /// Entries the first run's whole-disk crawl has listed so far.

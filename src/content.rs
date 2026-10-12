@@ -1332,7 +1332,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
 /// Should this file be in the content index? (Resolves its folders from the
 /// disk; a sync resolves each folder once, see `Scope`.)
 pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
-    Scope::new(home, &on_disk).file(path, size)
+    Scope::new(root_of(path, home), &on_disk).file(path, size)
 }
 
 /// Outside git repos, the text files are known by name and size.
@@ -1410,11 +1410,30 @@ fn skipped(rel: &[u8], name: &[u8], holds: impl Fn(&[u8]) -> bool) -> bool {
         || MARKED_DIRS.contains(&name) && MARKERS.iter().any(|m| holds(m))
 }
 
+/// The root a path's text is indexed under: the FSEARCH_VOLUMES volume
+/// holding it, else home. Each volume is scoped as home is.
+pub fn root_of<'a>(path: &[u8], home: &'a [u8]) -> &'a [u8] {
+    let under = |r: &[u8]| path.strip_prefix(r).is_some_and(|rest| rest.is_empty() || rest[0] == b'/');
+    crate::walk::volume_roots().iter().find(|v| under(v)).map_or(home, Vec::as_slice)
+}
+
+/// Every root whose text is indexed: home, then the volumes.
+pub fn roots(home: &[u8]) -> Vec<Vec<u8>> {
+    std::iter::once(home.to_vec()).chain(crate::walk::volume_roots().iter().cloned()).collect()
+}
+
+/// Does folder `dir` hold `root` (or is it `root`)? A whole-folder prefix,
+/// so "/Users/pe" doesn't hold "/Users/peet".
+pub fn contains(dir: &[u8], root: &[u8]) -> bool {
+    root.starts_with(dir) && (dir.ends_with(b"/") || root.len() == dir.len() || root[dir.len()] == b'/')
+}
+
 /// Can this path (file or folder) be in the indexed area: under home, not
 /// in a `.git`, and past no folder home's heuristics skip unless a git repo
 /// holds that folder (then its ignore files decide, see `Scope`)? Cheap: it
 /// touches the disk only to look for a repo above a skipped folder.
 pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
+    let home = root_of(path, home);
     let Some(rest) = path.strip_prefix(home) else { return false };
     if !rest.is_empty() && rest[0] != b'/' {
         return false;
@@ -3205,7 +3224,7 @@ fn take_best(per: &mut Vec<Cands>) -> Vec<Ranked> {
 /// children only unless `recursive`).
 pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     let look = |p: &[u8]| in_index(live, p);
-    Scope::new(home, &look).wanted(live, dir, recursive)
+    Scope::new(root_of(dir, home), &look).wanted(live, dir, recursive)
 }
 
 /// What should be indexed under these folders (direct children unless
@@ -3215,7 +3234,7 @@ pub fn wanted_now(live: &Live, home: &[u8], dirs: &[(Vec<u8>, bool)]) -> Vec<(Ve
     let mut scope = Scope::new(home, &look);
     (dirs.iter())
         .map(|(d, r)| {
-            let mut w = scope.wanted(live, d, *r);
+            let mut w = if root_of(d, home) == home { scope.wanted(live, d, *r) } else { Scope::new(root_of(d, home), &look).wanted(live, d, *r) };
             w.sort();
             (d.clone(), *r, w)
         })
@@ -3238,17 +3257,18 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
         if in_scope(d, home) {
             // A folder whose ignore files changed: so may all below it.
-            out.push((d.clone(), r || scope.rules_changed(d)));
-        } else if r && home.starts_with(d) && (d.ends_with(b"/") || home[d.len()..].starts_with(b"/")) {
-            // A subtree containing home (e.g. "/" rescanned): sync all of home.
-            out.push((home.to_vec(), true));
+            let changed = if root_of(d, home) == home { scope.rules_changed(d) } else { Scope::new(root_of(d, home), &look).rules_changed(d) };
+            out.push((d.clone(), r || changed));
+        } else if r {
+            // A subtree containing home or a volume (e.g. "/" rescanned): sync all of it.
+            out.extend(roots(home).into_iter().filter(|root| contains(d, root)).map(|root| (root, true)));
         }
     }
     out.sort();
     out.dedup();
     out.into_iter()
         .map(|(d, r)| {
-            let mut w = scope.wanted(live, &d, r);
+            let mut w = if root_of(&d, home) == home { scope.wanted(live, &d, r) } else { Scope::new(root_of(&d, home), &look).wanted(live, &d, r) };
             w.sort();
             (d, r, w)
         })
