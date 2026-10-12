@@ -222,7 +222,12 @@ fn install(login: bool) {
         println!("installed {}; the daemon starts on first use\n{agents}", bin.display());
         return;
     }
-    let log = data_dir().join("daemon.log");
+    // ~/Library/Logs, where a newsyslog rule can cap it (paths with spaces cannot be).
+    let log = PathBuf::from(home()).join("Library/Logs/fsearch.log");
+    // Carry the volumes to index into the login agent.
+    let env = std::env::var("FSEARCH_VOLUMES").map_or(String::new(), |v| {
+        format!("\n  <key>EnvironmentVariables</key><dict><key>FSEARCH_VOLUMES</key><string>{v}</string></dict>")
+    });
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -231,7 +236,7 @@ fn install(login: bool) {
   <key>Label</key><string>{LABEL}</string>
   <key>ProgramArguments</key><array><string>{}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><true/>{env}
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>

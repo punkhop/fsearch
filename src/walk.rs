@@ -23,6 +23,19 @@ pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// tracked, i.e. while SKIP is set.
 pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Volumes to index as if they were folders: the names in FSEARCH_VOLUMES
+/// (comma-separated, e.g. "illmaculate,thesaurus"). Every other mount point
+/// is still left alone.
+fn crossable(name: &[u8]) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            std::env::var("FSEARCH_VOLUMES").unwrap_or_default().split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect()
+        })
+        .iter()
+        .any(|n| n == name)
+}
+
 /// Entries the first run's whole-disk crawl has listed so far.
 pub static LISTED: AtomicUsize = AtomicUsize::new(0);
 
@@ -392,7 +405,7 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
         f += 4;
     }
     if dirattr & libc::ATTR_DIR_MOUNTSTATUS != 0 {
-        if rd32(b, f) & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 {
+        if rd32(b, f) & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 && !crossable(name) {
             kind |= FLAG_MOUNT;
         }
         f += 4;
