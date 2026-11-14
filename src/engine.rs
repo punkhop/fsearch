@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 // Every search scans the whole overlay (~1 ms per 100k entries), and a
@@ -960,6 +960,20 @@ fn release_memory() {
     unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
 }
 
+/// The name index's write lock for background work, taken without queueing
+/// for it. A queued writer holds back every new reader, so one long reader
+/// (a content sync of a whole drive) with an update queued behind it froze
+/// status and searches for the reader's whole length: 20-30 s on theater.
+fn write_live(s: &Shared) -> RwLockWriteGuard<'_, Option<Live>> {
+    loop {
+        match s.live.try_write() {
+            Ok(g) => return g,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+            Err(TryLockError::Poisoned(_)) => return s.live.write().unwrap(),
+        }
+    }
+}
+
 fn compact(shared: &Shared) {
     let t = Instant::now();
     let (ls, eid, synced) = {
@@ -977,7 +991,7 @@ fn compact(shared: &Shared) {
     // (After a failed save the file is older: keep the one just built.)
     let idx = if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx };
     let n = idx.n;
-    *shared.live.write().unwrap() = Some(Live::new(idx));
+    *write_live(shared) = Some(Live::new(idx));
     // Rare enough to afford the lstats: forget cache dirs whose tag is gone.
     if let Some(l) = walk::LAZY.get() {
         l.prune();
@@ -993,6 +1007,11 @@ fn compact(shared: &Shared) {
 fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     let t = Instant::now();
     let started = crate::query::now_secs();
+    // A replay's history up to here is relisted below, so the stream
+    // restarts from here: a replay of weeks that kept dropping otherwise
+    // started over from the old save forever, and with the watermark held
+    // at that save the index was never saved past it (17 days on theater).
+    let caught_up = shared.replaying.load(Ordering::Relaxed).then(fsevents::current_id);
     // synced_at 0 (unknown) relists everything: a full crawl, done in place.
     let (from, mut dirs) = {
         let g = shared.live.read().unwrap();
@@ -1008,14 +1027,22 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
     // answering meanwhile.
     for d in &dirs {
         let f = shared.live.read().unwrap().as_ref().unwrap().fetch(d, false);
-        shared.live.write().unwrap().as_mut().unwrap().apply(f);
+        write_live(shared).as_mut().unwrap().apply(f);
     }
     let trees = {
-        let mut g = shared.live.write().unwrap();
+        let mut g = write_live(shared);
         let live = g.as_mut().unwrap();
         live.synced_at = started;
+        if let Some(id) = caught_up {
+            live.event_id = live.event_id.max(id);
+        }
         std::mem::take(&mut live.trees)
     };
+    if let Some(id) = caught_up {
+        shared.watch(id);
+        // Saved now, a restart replays from here.
+        shared.save_requested.store(true, Ordering::Relaxed);
+    }
     let n = dirs.len();
     let _ = shared.content_tx.send((dirs, trees));
     shared.on_change.read().unwrap().iter().for_each(|f| f(&[(&b"/"[..], true)]));
@@ -1325,14 +1352,15 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     })
                     .collect()
             };
-            {
-                let mut g = shared.live.write().unwrap();
-                let live = g.as_mut().unwrap();
-                for f in fetched {
-                    if let Applied::Rebuild = live.apply(f) {
-                        rebuild = true;
-                    }
+            // One folder per write: a replay's batch can hold thousands.
+            for f in fetched {
+                if let Applied::Rebuild = write_live(shared).as_mut().unwrap().apply(f) {
+                    rebuild = true;
                 }
+            }
+            {
+                let mut g = write_live(shared);
+                let live = g.as_mut().unwrap();
                 // With a gap, everything is applied only up to its start;
                 // with folders held back or lazy changes pending, only up
                 // to their first event.
@@ -1360,14 +1388,15 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                 let live = g.as_ref().unwrap();
                 due.iter().map(|(p, r)| live.fetch(p, *r)).collect()
             };
-            {
-                let mut g = shared.live.write().unwrap();
-                let live = g.as_mut().unwrap();
-                for f in fetched {
-                    if let Applied::Rebuild = live.apply(f) {
-                        rebuild = true;
-                    }
+            // One folder per write: a replay's batch can hold thousands.
+            for f in fetched {
+                if let Applied::Rebuild = write_live(shared).as_mut().unwrap().apply(f) {
+                    rebuild = true;
                 }
+            }
+            {
+                let mut g = write_live(shared);
+                let live = g.as_mut().unwrap();
                 live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
                 trees.append(&mut live.trees);
             }
@@ -1377,7 +1406,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         } else if !had_dirs {
             // A wake that applied nothing — the floor may still have
             // risen: the watermark catches up to what arrived.
-            let mut g = shared.live.write().unwrap();
+            let mut g = write_live(shared);
             let live = g.as_mut().unwrap();
             live.event_id = advance(live.event_id, seen_max, pace.floor().min(lazy.floor()), gap.map(|(from, _)| from));
         }
@@ -1411,7 +1440,7 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             // except pending lazy changes, so cap at the oldest one's
             // arrival rather than freezing while a unit churns on.
             let wall = crate::query::now_secs();
-            shared.live.write().unwrap().as_mut().unwrap().synced_at = lazy.earliest_wall().map_or(wall, |w| wall.min(w));
+            write_live(shared).as_mut().unwrap().synced_at = lazy.earliest_wall().map_or(wall, |w| wall.min(w));
         }
         if let Some(l) = shared.live.read().unwrap().as_ref() {
             l.names_cache.trim_if_idle(Duration::from_secs(60));
