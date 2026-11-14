@@ -44,6 +44,9 @@ const REPLAY_MAX: Duration = Duration::from_secs(60);
 /// immediately loses track again: at most one per this long; a due one
 /// inside the window waits it out.
 const RELIST_COOLDOWN: Duration = Duration::from_secs(300);
+/// A save older than this (seconds) is caught up by a relist, not a replay:
+/// theater's 17-day-old save took over an hour to replay, and kept dropping.
+const REPLAY_MAX_AGE: u32 = 6 * 3600;
 
 pub struct Options {
     /// Where the index lives (`index.bin`, `content/`).
@@ -349,6 +352,8 @@ impl Engine {
                 // (A save from before event ids were stamped: from now.)
                 let from = if owner && from == 0 { fsevents::current_id() } else { from };
                 let head = fsevents::current_id();
+                let synced = s.live.read().unwrap().as_ref().map_or(0, |l| l.synced_at);
+                let age = crate::query::now_secs().saturating_sub(synced);
                 if from > head {
                     // fseventsd re-based its journal below the saved id (the
                     // saved id then sits in the future): replaying from it
@@ -359,6 +364,12 @@ impl Engine {
                     s.watch(head);
                     s.live.write().unwrap().as_mut().unwrap().event_id = head;
                     relist_changed(&s, "event ids re-based below our save", 0);
+                } else if owner && synced != 0 && age > REPLAY_MAX_AGE {
+                    // Hours of history replay slower than a relist, and on a
+                    // busy disk they drop events and start over. (Still
+                    // replaying, as at every start: the relist starts the
+                    // stream from before it, and asks for a save.)
+                    relist_changed(&s, "saved too long ago to replay", 0);
                 } else {
                     s.watch(from);
                 }
